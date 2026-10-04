@@ -1,41 +1,33 @@
 import os
+import re
+import json
+import html
 import asyncio
 import tempfile
 import threading
-import json
-import re
-import html
 import subprocess
-
 from pathlib import Path
-from urllib.parse import urlparse, urljoin
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urljoin, urlparse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 import yt_dlp
 import imageio_ffmpeg
 
 from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.error import RetryAfter
 
 
 # ============================================================
-# CONFIGURAZIONE
+# CONFIG
 # ============================================================
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-ALLOWED_USER_ID = os.environ.get("ALLOWED_USER_ID", "")
-
-RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+ALLOWED_USER_ID = os.environ.get("ALLOWED_USER_ID", "").strip()
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
 PORT = int(os.environ.get("PORT", "10000"))
 
-# Telegram Bot API: teniamo un piccolo margine sotto 50 MB.
 MAX_FILE_SIZE = 49 * 1024 * 1024
 
 FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
@@ -53,438 +45,376 @@ HEADERS = {
 
 
 # ============================================================
-# UTILITÀ
+# BASIC HELPERS
 # ============================================================
 
 def is_allowed(user_id: int) -> bool:
-    return (
-        bool(ALLOWED_USER_ID)
-        and str(user_id) == str(ALLOWED_USER_ID).strip()
-    )
+    if not ALLOWED_USER_ID:
+        return False
+
+    try:
+        return int(ALLOWED_USER_ID) == int(user_id)
+    except Exception:
+        return False
 
 
 def safe_filename(name: str) -> str:
+    name = html.unescape(name or "video")
     name = re.sub(r'[\\/:*?"<>|]+', "_", name)
-    name = name.strip()
-    return name[:100] or "video"
+    name = re.sub(r"\s+", " ", name).strip()
+
+    if not name:
+        name = "video"
+
+    return name[:150]
 
 
-def is_direct_video_url(url: str) -> bool:
+def looks_like_url(text: str) -> bool:
+    return bool(re.match(r"^https?://", text.strip(), re.I))
+
+
+def is_video_extension(url: str) -> bool:
     path = urlparse(url).path.lower()
 
-    return path.endswith((
+    extensions = (
         ".mp4",
         ".m4v",
         ".mov",
         ".webm",
         ".mkv",
         ".avi",
+        ".wmv",
+        ".flv",
+        ".ts",
         ".m3u8",
-    ))
+    )
+
+    return path.endswith(extensions)
 
 
-def is_m3u8_url(url: str) -> bool:
-    return ".m3u8" in urlparse(url).path.lower() or ".m3u8" in url.lower()
+def is_m3u8(url: str) -> bool:
+    return ".m3u8" in url.lower()
 
 
 # ============================================================
-# DOWNLOAD DIRETTO
+# DIRECT DOWNLOAD
 # ============================================================
 
-def download_direct(url: str, folder: str) -> str:
+def download_direct(url: str, workdir: str) -> str:
+    print(f"[DIRECT] {url}")
+
     response = requests.get(
         url,
-        stream=True,
-        timeout=(20, 60),
         headers=HEADERS,
+        stream=True,
+        timeout=(20, 120),
         allow_redirects=True,
     )
+
     response.raise_for_status()
 
-    content_type = (
-        response.headers.get("content-type", "")
-        .lower()
+    content_type = response.headers.get("content-type", "").lower()
+
+    if "text/html" in content_type:
+        response.close()
+        raise ValueError("URL restituisce HTML, non un file video diretto.")
+
+    filename = ""
+
+    content_disposition = response.headers.get("content-disposition", "")
+    match = re.search(
+        r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?',
+        content_disposition,
+        re.I,
     )
 
-    content_length = response.headers.get("content-length")
+    if match:
+        filename = match.group(1)
 
-    if content_length:
-        try:
-            if int(content_length) > MAX_FILE_SIZE * 20:
-                raise ValueError(
-                    "Il file è troppo grande per essere gestito."
-                )
-        except ValueError:
-            pass
+    if not filename:
+        filename = Path(urlparse(response.url).path).name
 
-    path_name = Path(
-        urlparse(response.url).path
-    ).name
+    filename = safe_filename(filename)
 
-    if not path_name:
-        path_name = "video.mp4"
+    if not Path(filename).suffix:
+        filename += ".mp4"
 
-    path_name = safe_filename(path_name)
-
-    if not Path(path_name).suffix:
-        if "webm" in content_type:
-            path_name += ".webm"
-        elif "quicktime" in content_type:
-            path_name += ".mov"
-        else:
-            path_name += ".mp4"
-
-    output = os.path.join(folder, path_name)
+    output = Path(workdir) / filename
 
     total = 0
 
-    with open(output, "wb") as file:
-        for chunk in response.iter_content(
-            chunk_size=1024 * 256
-        ):
-            if not chunk:
-                continue
+    try:
+        with open(output, "wb") as f:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if not chunk:
+                    continue
 
-            total += len(chunk)
+                total += len(chunk)
 
-            # Evitiamo di scaricare file enormi senza controllo.
-            if total > MAX_FILE_SIZE * 20:
-                file.close()
+                # Limite di sicurezza molto più alto del limite Telegram.
+                # Serve per evitare di riempire il disco Render.
+                if total > 1024 * 1024 * 1024:
+                    raise ValueError("File oltre 1 GB: download interrotto.")
 
-                try:
-                    os.remove(output)
-                except OSError:
-                    pass
+                f.write(chunk)
 
-                raise ValueError(
-                    "Il file è troppo grande."
-                )
+    finally:
+        response.close()
 
-            file.write(chunk)
+    if not output.exists() or output.stat().st_size == 0:
+        raise ValueError("Download vuoto.")
 
-    if total == 0:
-        raise ValueError(
-            "Il server ha restituito un file vuoto."
-        )
+    print(f"[DIRECT] scaricato: {output} ({output.stat().st_size} bytes)")
 
-    return output
+    return str(output)
 
 
 # ============================================================
 # YT-DLP
 # ============================================================
 
-def download_with_ytdlp(url: str, folder: str) -> str:
-    output = os.path.join(
-        folder,
-        "%(title).100s.%(ext)s"
+def download_with_ytdlp(url: str, workdir: str) -> str:
+    print(f"[YT-DLP] {url}")
+
+    output_template = str(
+        Path(workdir) / "%(title).120s.%(ext)s"
     )
 
     options = {
-        "outtmpl": output,
+        "outtmpl": output_template,
         "noplaylist": True,
+        "playlistend": 1,
         "quiet": True,
         "no_warnings": True,
-
-        # Prova prima video+audio.
-        "format": (
-            "bestvideo+bestaudio/"
-            "best"
-        ),
-
-        # Non lasciare playlist.
-        "playlistend": 1,
-
-        # Header realistici.
+        "retries": 3,
+        "fragment_retries": 3,
+        "concurrent_fragment_downloads": 4,
         "http_headers": HEADERS,
-
-        # Evita file singoli giganteschi quando yt-dlp
-        # conosce già la dimensione.
-        "max_filesize": MAX_FILE_SIZE * 2,
-
-        # Se il sito richiede un formato compatibile,
-        # preferiamo MP4 quando disponibile.
+        "format": "bestvideo*+bestaudio/best",
         "merge_output_format": "mp4",
+        "socket_timeout": 30,
+        "max_downloads": 1,
     }
 
     with yt_dlp.YoutubeDL(options) as ydl:
-        info = ydl.extract_info(
-            url,
-            download=True
-        )
+        info = ydl.extract_info(url, download=True)
 
-        filename = ydl.prepare_filename(info)
+        if not info:
+            raise ValueError("yt-dlp non ha trovato il video.")
 
-    if os.path.exists(filename):
-        return filename
+    files = [
+        p for p in Path(workdir).iterdir()
+        if p.is_file()
+    ]
 
-    base = os.path.splitext(filename)[0]
+    if not files:
+        raise ValueError("yt-dlp non ha prodotto alcun file.")
 
-    for extension in (
-        ".mp4",
-        ".webm",
-        ".mkv",
-        ".mov",
-        ".m4v",
-        ".avi",
-    ):
-        possible = base + extension
-
-        if os.path.exists(possible):
-            return possible
-
-    # Ultima ricerca nella cartella.
-    files = list(Path(folder).glob("*"))
-
+    # Preferiamo video conosciuti.
     video_files = [
         p for p in files
         if p.suffix.lower() in (
             ".mp4",
+            ".m4v",
+            ".mov",
             ".webm",
             ".mkv",
-            ".mov",
-            ".m4v",
             ".avi",
+            ".ts",
         )
-        and p.is_file()
     ]
 
     if video_files:
-        video_files.sort(
-            key=lambda p: p.stat().st_mtime,
-            reverse=True
-        )
+        result = max(video_files, key=lambda p: p.stat().st_mtime)
+    else:
+        result = max(files, key=lambda p: p.stat().st_mtime)
 
-        return str(video_files[0])
+    print(f"[YT-DLP] trovato: {result}")
 
-    raise FileNotFoundError(
-        "yt-dlp non ha prodotto un file video."
-    )
+    return str(result)
 
 
 # ============================================================
-# ESTRAZIONE VIDEO DALLA PAGINA HTML
+# HTML / PLAYER EXTRACTION
 # ============================================================
 
-def clean_extracted_url(value: str, page_url: str) -> str:
+def clean_url(value: str, base_url: str) -> str:
+    if not value:
+        return ""
+
     value = html.unescape(value)
 
     value = value.replace("\\/", "/")
-    value = value.replace("\\u0026", "&")
-    value = value.replace("\\u003d", "=")
     value = value.replace("\\u002F", "/")
-    value = value.strip()
+    value = value.replace("\\u002f", "/")
+    value = value.replace("&amp;", "&")
+
+    value = value.strip().strip("'\"")
 
     if value.startswith("//"):
-        value = "https:" + value
+        parsed = urlparse(base_url)
+        value = f"{parsed.scheme}:{value}"
 
     if value.startswith("/"):
-        value = urljoin(page_url, value)
+        value = urljoin(base_url, value)
 
-    if not value.startswith(("http://", "https://")):
-        return ""
+    if value.startswith("http://") or value.startswith("https://"):
+        return value
 
-    return value
+    return ""
 
 
-def extract_video_urls_from_html(
-    page_url: str,
-    page_html: str
-):
-    found = []
-
-    def add(url: str):
-        url = clean_extracted_url(
-            url,
-            page_url
-        )
-
-        if not url:
-            return
-
-        if url not in found:
-            found.append(url)
+def extract_video_urls_from_html(page_url: str, text: str):
+    candidates = []
 
     # --------------------------------------------------------
-    # 1. EroThots / player specifico
+    # <video src="">
     # --------------------------------------------------------
 
     patterns = [
-        r'class=["\'][^"\']*v-player[^"\']*["\'][^>]*>'
-        r'.{0,500}?'
-        r'<(?:video|source)[^>]+src=["\']([^"\']+)',
+        r'<video[^>]+src=["\']([^"\']+)["\']',
+        r'<source[^>]+src=["\']([^"\']+)["\']',
+        r'<source[^>]+data-src=["\']([^"\']+)["\']',
 
-        r'<(?:video|source)[^>]+src=["\']([^"\']+)',
+        # data attributes
+        r'data-video=["\']([^"\']+)["\']',
+        r'data-src=["\']([^"\']+)["\']',
+        r'data-url=["\']([^"\']+)["\']',
+        r'data-file=["\']([^"\']+)["\']',
 
-        r'<video[^>]+data-src=["\']([^"\']+)',
+        # OpenGraph
+        r'<meta[^>]+property=["\']og:video(?::url)?["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:video(?::url)?["\']',
 
-        r'<source[^>]+data-src=["\']([^"\']+)',
-
-        r'<video[^>]+data-video=["\']([^"\']+)',
-
-        r'<source[^>]+data-video=["\']([^"\']+)',
+        # JSON / JS
+        r'"contentUrl"\s*:\s*"([^"]+)"',
+        r'"videoUrl"\s*:\s*"([^"]+)"',
+        r'"video_url"\s*:\s*"([^"]+)"',
+        r'"source"\s*:\s*"([^"]+)"',
+        r'"src"\s*:\s*"([^"]+\.(?:mp4|m4v|webm|mov|m3u8)(?:\?[^"]*)?)"',
     ]
 
     for pattern in patterns:
-        for match in re.findall(
-            pattern,
-            page_html,
-            flags=re.IGNORECASE | re.DOTALL
-        ):
-            add(match)
+        for match in re.findall(pattern, text, re.I):
+            url = clean_url(match, page_url)
+
+            if url:
+                candidates.append(url)
 
     # --------------------------------------------------------
-    # 2. OpenGraph
+    # Cerca URL video generici nel codice HTML
     # --------------------------------------------------------
 
-    og_patterns = [
-        r'<meta[^>]+property=["\']og:video["\'][^>]+'
-        r'content=["\']([^"\']+)',
+    generic_pattern = (
+        r'https?://[^"\'\s<>\\]+'
+        r'\.(?:mp4|m4v|webm|mov|m3u8)'
+        r'(?:\?[^"\'\s<>\\]*)?'
+    )
 
-        r'<meta[^>]+property=["\']og:video:url["\'][^>]+'
-        r'content=["\']([^"\']+)',
+    for match in re.findall(generic_pattern, text, re.I):
+        url = clean_url(match, page_url)
 
-        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+'
-        r'property=["\']og:video["\']',
-
-        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+'
-        r'property=["\']og:video:url["\']',
-    ]
-
-    for pattern in og_patterns:
-        for match in re.findall(
-            pattern,
-            page_html,
-            flags=re.IGNORECASE
-        ):
-            add(match)
+        if url:
+            candidates.append(url)
 
     # --------------------------------------------------------
-    # 3. URL .mp4 / .m3u8 / altri formati video
+    # EroThots / player HTML
+    # Il player usa spesso .v-player con il video come figlio.
     # --------------------------------------------------------
 
-    url_patterns = [
-        r'https?://[^"\'>\s\\]+?\.mp4(?:\?[^"\'>\s\\]*)?',
-        r'https?://[^"\'>\s\\]+?\.m3u8(?:\?[^"\'>\s\\]*)?',
-        r'https?://[^"\'>\s\\]+?\.webm(?:\?[^"\'>\s\\]*)?',
-        r'https?://[^"\'>\s\\]+?\.m4v(?:\?[^"\'>\s\\]*)?',
-        r'https?://[^"\'>\s\\]+?\.mov(?:\?[^"\'>\s\\]*)?',
-    ]
+    player_match = re.search(
+        r'<[^>]+class=["\'][^"\']*v-player[^"\']*["\'][^>]*>'
+        r'(.*?)'
+        r'</[^>]+>',
+        text,
+        re.I | re.S,
+    )
 
-    for pattern in url_patterns:
-        for match in re.findall(
-            pattern,
-            page_html,
-            flags=re.IGNORECASE
-        ):
-            add(match)
+    if player_match:
+        block = player_match.group(1)
+
+        for pattern in patterns:
+            for match in re.findall(pattern, block, re.I):
+                url = clean_url(match, page_url)
+
+                if url:
+                    candidates.append(url)
 
     # --------------------------------------------------------
-    # 4. URL relative / escaped
+    # Deduplica mantenendo l'ordine
     # --------------------------------------------------------
 
-    relative_patterns = [
-        r'["\']([^"\']+\.mp4(?:\?[^"\']*)?)["\']',
-        r'["\']([^"\']+\.m3u8(?:\?[^"\']*)?)["\']',
-        r'["\']([^"\']+\.webm(?:\?[^"\']*)?)["\']',
-    ]
+    result = []
 
-    for pattern in relative_patterns:
-        for match in re.findall(
-            pattern,
-            page_html,
-            flags=re.IGNORECASE
-        ):
-            add(match)
+    for url in candidates:
+        if url not in result:
+            result.append(url)
 
-    return found
+    return result
 
 
-def extract_video_from_page(
-    url: str,
-    folder: str
-) -> str:
+def extract_video_from_page(url: str, workdir: str) -> str:
+    print(f"[HTML] analizzo pagina: {url}")
+
     response = requests.get(
         url,
-        headers={
-            **HEADERS,
-            "Accept": (
-                "text/html,application/xhtml+xml,"
-                "application/xml;q=0.9,*/*;q=0.8"
-            ),
-        },
-        timeout=(20, 30),
+        headers=HEADERS,
+        timeout=(20, 60),
         allow_redirects=True,
     )
 
     response.raise_for_status()
 
-    page_html = response.text
+    content = response.text
 
-    video_urls = extract_video_urls_from_html(
+    urls = extract_video_urls_from_html(
         response.url,
-        page_html
+        content,
     )
 
-    if not video_urls:
-        raise RuntimeError(
-            "Nessuna sorgente video trovata nella pagina."
-        )
+    if not urls:
+        raise ValueError("Nessun video trovato nell'HTML.")
 
-    print(
-        f"Trovate {len(video_urls)} possibili sorgenti video."
-    )
+    print(f"[HTML] trovati {len(urls)} possibili sorgenti.")
 
     last_error = None
 
-    for video_url in video_urls:
+    for video_url in urls:
         try:
-            print(
-                f"Provo sorgente: {video_url[:180]}"
-            )
+            print(f"[HTML] provo: {video_url}")
 
-            if is_m3u8_url(video_url):
-                output = os.path.join(
-                    folder,
-                    "video_from_m3u8.mp4"
-                )
+            if is_m3u8(video_url):
+                output = str(Path(workdir) / "hls_video.mp4")
 
                 convert_with_ffmpeg(
                     video_url,
                     output,
-                    compress=False
+                    compress=False,
                 )
 
-                if os.path.exists(output):
+                if Path(output).exists():
                     return output
 
             else:
                 return download_direct(
                     video_url,
-                    folder
+                    workdir,
                 )
 
-        except Exception as error:
-            last_error = error
-            print(
-                f"Sorgente non utilizzabile: {error}"
-            )
+        except Exception as exc:
+            print(f"[HTML] sorgente fallita: {exc}")
+            last_error = exc
 
-    raise RuntimeError(
-        f"Nessuna sorgente video utilizzabile. "
-        f"Ultimo errore: {last_error}"
+    raise ValueError(
+        f"Tutte le sorgenti video trovate hanno fallito: {last_error}"
     )
 
 
 # ============================================================
-# FFmpeg
+# FFMPEG
 # ============================================================
 
-def run_ffmpeg(
-    input_path: str,
-    output_path: str,
-    extra_args=None
-):
+def run_ffmpeg(input_file: str, output_file: str, extra_args):
     command = [
         FFMPEG_PATH,
         "-y",
@@ -492,17 +422,18 @@ def run_ffmpeg(
         "-loglevel",
         "error",
         "-i",
-        input_path,
+        input_file,
     ]
 
-    if extra_args:
-        command.extend(extra_args)
+    command.extend(extra_args)
 
     command.extend([
         "-movflags",
         "+faststart",
-        output_path,
+        output_file,
     ])
+
+    print("[FFMPEG]", " ".join(command))
 
     result = subprocess.run(
         command,
@@ -513,35 +444,46 @@ def run_ffmpeg(
     )
 
     if result.returncode != 0:
-        print("FFmpeg error:")
-        print(result.stderr)
-
         raise RuntimeError(
-            result.stderr[-2000:]
-            or "Errore FFmpeg."
+            result.stderr[-4000:] or "FFmpeg ha restituito un errore."
         )
 
 
 def convert_with_ffmpeg(
-    input_path: str,
-    output_path: str,
-    compress: bool = False
+    input_file: str,
+    output_file: str,
+    compress: bool = False,
+    small: bool = False,
 ):
     if compress:
+        if small:
+            scale = "854:-2"
+            crf = "32"
+            audio = "64k"
+        else:
+            scale = "1280:-2"
+            crf = "28"
+            audio = "96k"
+
         args = [
             "-vf",
-            "scale='min(1280,iw)':-2",
+            f"scale={scale}",
             "-c:v",
             "libx264",
             "-preset",
             "veryfast",
             "-crf",
-            "28",
+            crf,
+            "-pix_fmt",
+            "yuv420p",
             "-c:a",
             "aac",
             "-b:a",
-            "96k",
+            audio,
+            "-ar",
+            "44100",
         ]
+
     else:
         args = [
             "-c:v",
@@ -550,25 +492,29 @@ def convert_with_ffmpeg(
             "veryfast",
             "-crf",
             "23",
+            "-pix_fmt",
+            "yuv420p",
             "-c:a",
             "aac",
             "-b:a",
             "128k",
+            "-ar",
+            "44100",
         ]
 
     run_ffmpeg(
-        input_path,
-        output_path,
-        args
+        input_file,
+        output_file,
+        args,
     )
 
 
-def probe_video(input_path: str):
+def probe_video(path: str):
     command = [
         FFMPEG_PATH,
         "-hide_banner",
         "-i",
-        input_path,
+        path,
     ]
 
     result = subprocess.run(
@@ -576,28 +522,24 @@ def probe_video(input_path: str):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        timeout=120,
+        timeout=60,
     )
 
-    output = (
-        result.stdout
-        + "\n"
-        + result.stderr
-    )
+    text = result.stderr
 
-    video_codec = ""
-    audio_codec = ""
+    video_codec = None
+    audio_codec = None
 
     video_match = re.search(
-        r"Video:\s*([a-zA-Z0-9_]+)",
-        output,
-        flags=re.IGNORECASE
+        r"Video:\s*([^,\s]+)",
+        text,
+        re.I,
     )
 
     audio_match = re.search(
-        r"Audio:\s*([a-zA-Z0-9_]+)",
-        output,
-        flags=re.IGNORECASE
+        r"Audio:\s*([^,\s]+)",
+        text,
+        re.I,
     )
 
     if video_match:
@@ -609,42 +551,31 @@ def probe_video(input_path: str):
     return video_codec, audio_codec
 
 
-def is_telegram_compatible(input_path: str) -> bool:
-    suffix = Path(input_path).suffix.lower()
-
-    if suffix != ".mp4":
+def is_telegram_compatible(path: str) -> bool:
+    if Path(path).suffix.lower() != ".mp4":
         return False
 
     try:
-        video_codec, audio_codec = probe_video(
-            input_path
-        )
+        video_codec, audio_codec = probe_video(path)
 
         print(
-            "Codec video:",
-            video_codec,
-            "| Codec audio:",
-            audio_codec
+            f"[PROBE] video={video_codec}, audio={audio_codec}"
         )
 
-        # H.264 + AAC è la combinazione più sicura
-        # per la riproduzione video su Telegram/iPhone.
-        return (
-            video_codec in (
-                "h264",
-                "avc1",
-            )
-            and audio_codec in (
-                "aac",
-                "mp4a",
-            )
+        video_ok = video_codec in (
+            "h264",
+            "avc1",
         )
 
-    except Exception as error:
-        print(
-            f"Probe video fallito: {error}"
+        audio_ok = audio_codec in (
+            "aac",
+            "mp4a",
         )
 
+        return video_ok and audio_ok
+
+    except Exception as exc:
+        print(f"[PROBE] errore: {exc}")
         return False
 
 
@@ -652,614 +583,515 @@ def is_telegram_compatible(input_path: str) -> bool:
 # PREPARAZIONE VIDEO
 # ============================================================
 
-def prepare_video(
-    input_path: str,
-    folder: str
-) -> str:
-
-    file_size = os.path.getsize(
-        input_path
-    )
+def prepare_video(path: str, workdir: str) -> str:
+    file_path = Path(path)
+    size = file_path.stat().st_size
 
     print(
-        f"File originale: "
-        f"{file_size / 1024 / 1024:.2f} MB"
+        f"[PREPARE] file={file_path.name}, "
+        f"size={size} bytes"
     )
 
     # --------------------------------------------------------
-    # CASO IDEALE:
-    # MP4 + H264/AAC + sotto il limite.
-    #
-    # Lo inviamo direttamente senza conversione.
+    # Se è già perfetto e sotto il limite:
+    # NON convertire.
     # --------------------------------------------------------
 
-    if (
-        file_size <= MAX_FILE_SIZE
-        and is_telegram_compatible(input_path)
-    ):
-        print(
-            "Video già compatibile: "
-            "nessuna conversione necessaria."
-        )
+    if size <= MAX_FILE_SIZE:
+        if is_telegram_compatible(path):
+            print("[PREPARE] già compatibile: invio diretto.")
+            return path
 
-        return input_path
+        print("[PREPARE] non compatibile: converto in MP4 H264/AAC.")
 
-    # --------------------------------------------------------
-    # Se è sotto il limite ma non è compatibile,
-    # convertiamo per evitare il famoso video bianco.
-    # --------------------------------------------------------
-
-    if file_size <= MAX_FILE_SIZE:
-        output = os.path.join(
-            folder,
-            "telegram_compatible.mp4"
-        )
-
-        print(
-            "Video sotto il limite ma non "
-            "compatibile: conversione."
+        converted = str(
+            Path(workdir) / "telegram_compatible.mp4"
         )
 
         convert_with_ffmpeg(
-            input_path,
-            output,
-            compress=False
+            path,
+            converted,
+            compress=False,
         )
 
-        if os.path.getsize(output) > MAX_FILE_SIZE:
-            raise ValueError(
-                "La conversione ha prodotto "
-                "un file troppo grande."
-            )
+        if Path(converted).stat().st_size <= MAX_FILE_SIZE:
+            return converted
 
-        return output
+        path = converted
+        size = Path(path).stat().st_size
 
     # --------------------------------------------------------
-    # FILE TROPPO GRANDE:
-    # solo ora facciamo compressione.
+    # Sopra il limite: prima compressione.
     # --------------------------------------------------------
 
-    print(
-        "Video sopra il limite: "
-        "inizio compressione."
-    )
+    print("[PREPARE] file oltre il limite: comprimo.")
 
-    compressed = os.path.join(
-        folder,
-        "telegram_compressed.mp4"
+    compressed = str(
+        Path(workdir) / "compressed.mp4"
     )
 
     convert_with_ffmpeg(
-        input_path,
+        path,
         compressed,
-        compress=True
+        compress=True,
+        small=False,
     )
 
-    compressed_size = os.path.getsize(
-        compressed
-    )
+    compressed_size = Path(compressed).stat().st_size
 
     print(
-        f"Prima compressione: "
-        f"{compressed_size / 1024 / 1024:.2f} MB"
+        f"[PREPARE] prima compressione: "
+        f"{compressed_size} bytes"
     )
 
     if compressed_size <= MAX_FILE_SIZE:
         return compressed
 
     # --------------------------------------------------------
-    # Secondo tentativo più aggressivo.
+    # Seconda compressione più aggressiva.
     # --------------------------------------------------------
 
-    compressed2 = os.path.join(
-        folder,
-        "telegram_compressed_2.mp4"
+    print("[PREPARE] ancora troppo grande: seconda compressione.")
+
+    compressed_small = str(
+        Path(workdir) / "compressed_small.mp4"
     )
 
-    run_ffmpeg(
-        input_path,
-        compressed2,
-        [
-            "-vf",
-            "scale='min(854,iw)':-2",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "32",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "64k",
-        ]
+    convert_with_ffmpeg(
+        compressed,
+        compressed_small,
+        compress=True,
+        small=True,
     )
 
-    compressed2_size = os.path.getsize(
-        compressed2
-    )
+    final_size = Path(compressed_small).stat().st_size
 
     print(
-        f"Seconda compressione: "
-        f"{compressed2_size / 1024 / 1024:.2f} MB"
+        f"[PREPARE] seconda compressione: "
+        f"{final_size} bytes"
     )
 
-    if compressed2_size <= MAX_FILE_SIZE:
-        return compressed2
+    if final_size <= MAX_FILE_SIZE:
+        return compressed_small
 
     raise ValueError(
-        "Il video rimane troppo grande anche "
-        "dopo la compressione."
+        "Il video rimane oltre il limite di Telegram "
+        "anche dopo la compressione."
     )
 
 
 # ============================================================
-# DOWNLOAD INTELLIGENTE
+# DOWNLOAD CASCADE
 # ============================================================
 
-def download_video(
-    url: str,
-    folder: str
-) -> str:
-
+def download_video(url: str, workdir: str) -> str:
     errors = []
 
     # --------------------------------------------------------
-    # METODO 1:
-    # URL direttamente video.
+    # 1. URL diretto
     # --------------------------------------------------------
 
-    if is_direct_video_url(url):
+    if is_video_extension(url):
         try:
-            print(
-                "Metodo 1: download diretto."
-            )
-
-            return download_direct(
-                url,
-                folder
-            )
-
-        except Exception as error:
-            errors.append(
-                f"diretto: {error}"
-            )
+            return download_direct(url, workdir)
+        except Exception as exc:
+            errors.append(f"direct: {exc}")
 
     # --------------------------------------------------------
-    # METODO 2:
-    # yt-dlp.
+    # 2. yt-dlp
     # --------------------------------------------------------
 
     try:
-        print(
-            "Metodo 2: yt-dlp."
-        )
-
-        return download_with_ytdlp(
-            url,
-            folder
-        )
-
-    except Exception as error:
-        print(
-            f"yt-dlp fallito: {error}"
-        )
-
-        errors.append(
-            f"yt-dlp: {error}"
-        )
+        return download_with_ytdlp(url, workdir)
+    except Exception as exc:
+        print(f"[YT-DLP] fallito: {exc}")
+        errors.append(f"yt-dlp: {exc}")
 
     # --------------------------------------------------------
-    # METODO 3:
-    # estrazione HTML / player.
+    # 3. HTML / player
     # --------------------------------------------------------
 
     try:
-        print(
-            "Metodo 3: estrazione HTML/player."
-        )
+        return extract_video_from_page(url, workdir)
+    except Exception as exc:
+        print(f"[HTML] fallito: {exc}")
+        errors.append(f"html: {exc}")
 
-        return extract_video_from_page(
-            url,
-            folder
-        )
-
-    except Exception as error:
-        print(
-            f"HTML/player fallito: {error}"
-        )
-
-        errors.append(
-            f"html: {error}"
-        )
-
-    raise RuntimeError(
-        "Nessun metodo è riuscito.\n"
-        + "\n".join(errors[-3:])
+    raise ValueError(
+        "Non sono riuscito a scaricare il video.\n\n"
+        + "\n".join(errors[-5:])
     )
 
 
 # ============================================================
-# TELEGRAM
+# TELEGRAM HANDLERS
 # ============================================================
 
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user:
+        return
+
+    if not is_allowed(update.effective_user.id):
+        return
+
     await update.message.reply_text(
-        "👋 Mandami un link video e proverò "
-        "automaticamente diversi metodi per "
-        "scaricarlo e inviartelo come video."
+        "Mandami il link del video."
     )
 
 
-async def myid(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user:
+        return
+
     await update.message.reply_text(
-        f"Il tuo Telegram ID è:\n"
-        f"{update.effective_user.id}"
+        str(update.effective_user.id)
     )
 
 
 async def handle_link(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
-    user_id = update.effective_user.id
-
-    if not is_allowed(user_id):
-        await update.message.reply_text(
-            "🔐 Questo bot non è configurato "
-            "per questo account."
-        )
+    if not update.effective_user or not update.message:
         return
 
-    text = update.message.text.strip()
+    if not is_allowed(update.effective_user.id):
+        return
 
-    if not text.startswith((
-        "http://",
-        "https://"
-    )):
+    text = (update.message.text or "").strip()
+
+    if not looks_like_url(text):
         await update.message.reply_text(
-            "❌ Mandami un link che inizi "
-            "con http:// o https://"
+            "Mandami un link http:// o https://"
         )
         return
 
     status = await update.message.reply_text(
-        "🔎 Analizzo il link e cerco il video..."
+        "⏳ Scarico il video..."
     )
 
-    with tempfile.TemporaryDirectory() as folder:
+    try:
+        # Tutto il lavoro pesante fuori dal loop Telegram.
+        result = await asyncio.to_thread(
+            process_video,
+            text,
+        )
+
+        await status.edit_text(
+            "📤 Invio il video su Telegram..."
+        )
+
+        final_path, workdir = result
 
         try:
-
-            # ------------------------------------------------
-            # DOWNLOAD
-            # ------------------------------------------------
-
-            file_path = await asyncio.to_thread(
-                download_video,
-                text,
-                folder
-            )
-
-            if not os.path.exists(file_path):
-                raise FileNotFoundError(
-                    "File video non trovato."
-                )
-
-            await status.edit_text(
-                "🎬 Video trovato. "
-                "Controllo formato e dimensione..."
-            )
-
-            # ------------------------------------------------
-            # PREPARAZIONE
-            # ------------------------------------------------
-
-            final_path = await asyncio.to_thread(
-                prepare_video,
-                file_path,
-                folder
-            )
-
-            if not os.path.exists(final_path):
-                raise FileNotFoundError(
-                    "Video finale non trovato."
-                )
-
-            final_size = os.path.getsize(
-                final_path
-            )
-
-            if final_size > MAX_FILE_SIZE:
-                raise ValueError(
-                    "Il video finale supera "
-                    "il limite di Telegram."
-                )
-
-            await status.edit_text(
-                "📤 Video pronto. Te lo invio..."
-            )
-
-            # ------------------------------------------------
-            # INVIO COME VIDEO
-            # ------------------------------------------------
-
-            with open(
-                final_path,
-                "rb"
-            ) as video:
-
+            with open(final_path, "rb") as video_file:
                 await update.message.reply_video(
-                    video=video,
-                    caption="✅ Ecco il tuo video.",
+                    video=video_file,
                     supports_streaming=True,
+                    read_timeout=300,
+                    write_timeout=300,
+                    connect_timeout=60,
+                    pool_timeout=60,
                 )
 
-            try:
-                await status.delete()
-            except Exception:
-                pass
+            await status.delete()
 
-        except Exception as error:
+        finally:
+            # La directory temporanea viene eliminata dopo l'invio.
+            import shutil
+            shutil.rmtree(workdir, ignore_errors=True)
 
-            print(
-                "ERRORE COMPLETO:"
+    except Exception as exc:
+        print(f"[ERROR] {exc}")
+
+        try:
+            await status.edit_text(
+                "❌ Non sono riuscito a scaricare/inviare il video.\n\n"
+                f"{str(exc)[:2500]}"
             )
-            print(error)
+        except Exception:
+            pass
 
-            try:
-                await status.edit_text(
-                    "❌ Non sono riuscito a "
-                    "scaricare/preparare questo video.\n\n"
-                    "Ho provato automaticamente "
-                    "più metodi di estrazione."
-                )
-            except Exception:
-                pass
+
+def process_video(url: str):
+    workdir = tempfile.mkdtemp(
+        prefix="telegram_video_"
+    )
+
+    try:
+        downloaded = download_video(
+            url,
+            workdir,
+        )
+
+        final_path = prepare_video(
+            downloaded,
+            workdir,
+        )
+
+        if not Path(final_path).exists():
+            raise ValueError(
+                "Il file finale non esiste."
+            )
+
+        final_size = Path(final_path).stat().st_size
+
+        if final_size > MAX_FILE_SIZE:
+            raise ValueError(
+                "Il file finale supera il limite Telegram."
+            )
+
+        print(
+            f"[FINAL] {final_path} "
+            f"({final_size} bytes)"
+        )
+
+        return final_path, workdir
+
+    except Exception:
+        import shutil
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise
 
 
 # ============================================================
 # WEBHOOK SERVER
 # ============================================================
 
-async def process_update_safe(
-    application,
-    update
-):
+APPLICATION = None
+EVENT_LOOP = None
+
+
+async def process_update_safe(update_data):
+    global APPLICATION
+
     try:
-        await application.process_update(
-            update
+        update = Update.de_json(
+            update_data,
+            APPLICATION.bot,
         )
 
-    except Exception as error:
-        print(
-            "Errore durante l'elaborazione "
-            "dell'update:"
-        )
-        print(error)
+        await APPLICATION.process_update(update)
+
+    except Exception as exc:
+        print(f"[UPDATE ERROR] {exc}")
 
 
-class TelegramWebhookHandler(
-    BaseHTTPRequestHandler
-):
+class TelegramWebhookHandler(BaseHTTPRequestHandler):
+
+    def log_message(self, format, *args):
+        # Evita di riempire i log Render.
+        return
 
     def do_GET(self):
-
-        if self.path in (
-            "/",
-            "/health"
-        ):
-            self.send_response(200)
-
-            self.send_header(
-                "Content-Type",
-                "text/plain"
-            )
-
-            self.end_headers()
-
-            self.wfile.write(
-                b"OK"
-            )
-
-            return
-
-        self.send_response(404)
+        self.send_response(200)
+        self.send_header(
+            "Content-Type",
+            "text/plain; charset=utf-8",
+        )
         self.end_headers()
+        self.wfile.write(
+            b"Telegram downloader bot is running."
+        )
 
     def do_POST(self):
-
-        if self.path != "/telegram":
-            self.send_response(404)
-            self.end_headers()
-            return
+        global EVENT_LOOP
 
         try:
-
-            content_length = int(
+            length = int(
                 self.headers.get(
                     "Content-Length",
-                    "0"
+                    "0",
                 )
             )
 
-            body = self.rfile.read(
-                content_length
-            )
+            body = self.rfile.read(length)
 
-            data = json.loads(
+            update_data = json.loads(
                 body.decode("utf-8")
             )
 
-            update = Update.de_json(
-                data,
-                self.server.application.bot
-            )
-
             # IMPORTANTISSIMO:
-            #
             # NON aspettiamo che il download finisca.
             #
-            # Rispondiamo subito a Telegram con HTTP 200.
-            # In questo modo Telegram non reinvia lo stesso
-            # messaggio mentre il bot sta scaricando il video.
+            # Telegram riceve subito HTTP 200.
+            # Questo evita retry, duplicati e Flood Control.
 
             asyncio.run_coroutine_threadsafe(
-                process_update_safe(
-                    self.server.application,
-                    update
-                ),
-                self.server.loop
+                process_update_safe(update_data),
+                EVENT_LOOP,
             )
 
             self.send_response(200)
+            self.send_header(
+                "Content-Type",
+                "text/plain",
+            )
             self.end_headers()
+            self.wfile.write(b"OK")
 
-            self.wfile.write(
-                b"OK"
-            )
+        except Exception as exc:
+            print(f"[WEBHOOK ERROR] {exc}")
 
-        except Exception as error:
-
-            print(
-                f"Webhook error: {error}"
-            )
-
+            # Anche in caso di problema interno rispondiamo
+            # rapidamente, evitando una valanga di retry.
             try:
-                self.send_response(500)
+                self.send_response(200)
                 self.end_headers()
+                self.wfile.write(b"OK")
             except Exception:
                 pass
 
-    def log_message(
-        self,
-        format,
-        *args
-    ):
-        return
 
+def start_http_server():
+    server = ThreadingHTTPServer(
+        ("0.0.0.0", PORT),
+        TelegramWebhookHandler,
+    )
 
-class TelegramHTTPServer(
-    HTTPServer
-):
+    print(
+        f"[HTTP] server listening on 0.0.0.0:{PORT}"
+    )
 
-    def __init__(
-        self,
-        server_address,
-        application,
-        loop
-    ):
-        super().__init__(
-            server_address,
-            TelegramWebhookHandler
-        )
-
-        self.application = application
-        self.loop = loop
+    server.serve_forever()
 
 
 # ============================================================
-# AVVIO
+# TELEGRAM WEBHOOK SETUP
 # ============================================================
 
-async def main():
-
-    if not BOT_TOKEN:
-        raise RuntimeError(
-            "BOT_TOKEN non configurato."
-        )
-
+async def set_webhook_safely():
     if not RENDER_EXTERNAL_URL:
         raise RuntimeError(
             "RENDER_EXTERNAL_URL non configurato."
         )
-
-    application = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .build()
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "start",
-            start
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "myid",
-            myid
-        )
-    )
-
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT
-            & ~filters.COMMAND,
-            handle_link
-        )
-    )
-
-    await application.initialize()
-    await application.start()
 
     webhook_url = (
         RENDER_EXTERNAL_URL.rstrip("/")
         + "/telegram"
     )
 
-    await application.bot.set_webhook(
-        url=webhook_url,
-        drop_pending_updates=True
+    print(
+        f"[TELEGRAM] imposto webhook: {webhook_url}"
     )
 
-    loop = asyncio.get_running_loop()
+    while True:
+        try:
+            await APPLICATION.bot.set_webhook(
+                url=webhook_url,
+                drop_pending_updates=False,
+            )
 
-    server = TelegramHTTPServer(
-        (
-            "0.0.0.0",
-            PORT
-        ),
-        application,
-        loop
+            print(
+                "[TELEGRAM] webhook impostato correttamente."
+            )
+
+            return
+
+        except RetryAfter as exc:
+            seconds = max(
+                1,
+                int(getattr(exc, "retry_after", 1)),
+            )
+
+            print(
+                f"[TELEGRAM] Flood control. "
+                f"Attendo {seconds} secondi..."
+            )
+
+            await asyncio.sleep(
+                seconds + 1
+            )
+
+        except Exception as exc:
+            print(
+                f"[TELEGRAM] errore webhook: {exc}"
+            )
+
+            # Non facciamo crashare Render.
+            # Ritentiamo automaticamente.
+            await asyncio.sleep(10)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+async def main():
+    global APPLICATION
+    global EVENT_LOOP
+
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "BOT_TOKEN non configurato."
+        )
+
+    if not ALLOWED_USER_ID:
+        raise RuntimeError(
+            "ALLOWED_USER_ID non configurato."
+        )
+
+    EVENT_LOOP = asyncio.get_running_loop()
+
+    APPLICATION = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .build()
     )
+
+    APPLICATION.add_handler(
+        CommandHandler("start", start)
+    )
+
+    APPLICATION.add_handler(
+        CommandHandler("myid", myid)
+    )
+
+    APPLICATION.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_link,
+        )
+    )
+
+    # --------------------------------------------------------
+    # Avvio Application.
+    # NON usiamo polling.
+    # --------------------------------------------------------
+
+    await APPLICATION.initialize()
+    await APPLICATION.start()
+
+    # --------------------------------------------------------
+    # Server HTTP Render.
+    # --------------------------------------------------------
 
     server_thread = threading.Thread(
-        target=server.serve_forever,
-        daemon=True
+        target=start_http_server,
+        daemon=True,
     )
 
     server_thread.start()
 
-    print(
-        f"Bot avviato."
-    )
+    # --------------------------------------------------------
+    # Webhook con gestione automatica Flood Control.
+    # --------------------------------------------------------
 
-    print(
-        f"Webhook: {webhook_url}"
-    )
+    await set_webhook_safely()
+
+    print("[BOT] avviato correttamente.")
 
     try:
-
+        # Il processo rimane vivo.
         await asyncio.Event().wait()
 
     finally:
+        print("[BOT] shutdown...")
 
-        server.shutdown()
-        server.server_close()
-
-        await application.bot.delete_webhook()
-
-        await application.stop()
-        await application.shutdown()
+        try:
+            await APPLICATION.stop()
+        finally:
+            await APPLICATION.shutdown()
 
 
 if __name__ == "__main__":
