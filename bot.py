@@ -1,8 +1,11 @@
 import os
 import asyncio
 import tempfile
+import threading
 from pathlib import Path
 from urllib.parse import urlparse
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import json
 
 import requests
 import yt_dlp
@@ -170,6 +173,68 @@ async def handle_link(
             )
 
 
+class TelegramWebhookHandler(BaseHTTPRequestHandler):
+
+    def do_GET(self):
+        if self.path == "/" or self.path == "/health":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK")
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def do_POST(self):
+        if self.path != "/telegram":
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        try:
+            content_length = int(
+                self.headers.get("Content-Length", "0")
+            )
+
+            body = self.rfile.read(content_length)
+            data = json.loads(body.decode("utf-8"))
+
+            update = Update.de_json(
+                data,
+                self.server.application.bot
+            )
+
+            future = asyncio.run_coroutine_threadsafe(
+                self.server.application.process_update(update),
+                self.server.loop
+            )
+
+            future.result(timeout=10)
+
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
+
+        except Exception:
+            self.send_response(500)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        return
+
+
+class TelegramHTTPServer(HTTPServer):
+
+    def __init__(self, server_address, application, loop):
+        super().__init__(
+            server_address,
+            TelegramWebhookHandler
+        )
+        self.application = application
+        self.loop = loop
+
+
 async def main():
     if not BOT_TOKEN:
         raise RuntimeError(
@@ -202,19 +267,50 @@ async def main():
         )
     )
 
+    await application.initialize()
+    await application.start()
+
     webhook_url = (
         RENDER_EXTERNAL_URL.rstrip("/")
         + "/telegram"
     )
 
-    application.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path="telegram",
-        webhook_url=webhook_url,
-        drop_pending_updates=True,
+    await application.bot.set_webhook(
+        url=webhook_url,
+        drop_pending_updates=True
     )
+
+    loop = asyncio.get_running_loop()
+
+    server = TelegramHTTPServer(
+        ("0.0.0.0", PORT),
+        application,
+        loop
+    )
+
+    server_thread = threading.Thread(
+        target=server.serve_forever,
+        daemon=True
+    )
+
+    server_thread.start()
+
+    print(
+        f"Bot avviato. Webhook: {webhook_url}"
+    )
+
+    try:
+        await asyncio.Event().wait()
+
+    finally:
+        server.shutdown()
+        server.server_close()
+
+        await application.bot.delete_webhook()
+
+        await application.stop()
+        await application.shutdown()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
