@@ -9,6 +9,8 @@ import json
 
 import requests
 import yt_dlp
+import imageio_ffmpeg
+
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -27,6 +29,8 @@ PORT = int(os.environ.get("PORT", "10000"))
 
 MAX_FILE_SIZE = 49 * 1024 * 1024
 
+FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+
 
 def is_allowed(user_id: int) -> bool:
     return bool(ALLOWED_USER_ID) and str(user_id) == ALLOWED_USER_ID
@@ -34,8 +38,8 @@ def is_allowed(user_id: int) -> bool:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Mandami un link e proverò a scaricare il contenuto "
-        "e rimandartelo qui."
+        "👋 Mandami un link video e proverò a scaricarlo "
+        "e rimandartelo qui come video."
     )
 
 
@@ -57,10 +61,13 @@ def download_direct(url: str, folder: str) -> str:
     content_length = response.headers.get("content-length")
 
     if content_length and int(content_length) > MAX_FILE_SIZE:
-        raise ValueError("Il file è troppo grande.")
+        raise ValueError("Il video è troppo grande.")
 
-    filename = Path(urlparse(url).path).name or "download"
+    filename = Path(urlparse(url).path).name or "video.mp4"
     filename = filename[:100]
+
+    if not Path(filename).suffix:
+        filename += ".mp4"
 
     path = os.path.join(folder, filename)
 
@@ -76,7 +83,7 @@ def download_direct(url: str, folder: str) -> str:
             if total > MAX_FILE_SIZE:
                 file.close()
                 os.remove(path)
-                raise ValueError("Il file è troppo grande.")
+                raise ValueError("Il video è troppo grande.")
 
             file.write(chunk)
 
@@ -95,11 +102,31 @@ def download_media(url: str, folder: str) -> str:
         "max_filesize": MAX_FILE_SIZE,
         "quiet": True,
         "no_warnings": True,
+
+        # Preferiamo MP4 perché Telegram può riprodurlo
+        # direttamente come video.
+        "format": (
+            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+            "best[ext=mp4]/"
+            "best"
+        ),
+
+        # Se servono video+audio separati, li uniamo in MP4.
+        "merge_output_format": "mp4",
+
+        "ffmpeg_location": FFMPEG_PATH,
     }
 
     with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
+
+        # Se yt-dlp ha creato il file MP4 risultante dopo il merge,
+        # usiamo quello.
+        possible_mp4 = os.path.splitext(filename)[0] + ".mp4"
+
+        if os.path.exists(possible_mp4):
+            filename = possible_mp4
 
     return filename
 
@@ -126,17 +153,21 @@ async def handle_link(
         return
 
     status = await update.message.reply_text(
-        "⏳ Sto scaricando..."
+        "⏳ Sto scaricando il video..."
     )
 
     with tempfile.TemporaryDirectory() as folder:
         try:
+            # Prima proviamo con yt-dlp.
             try:
                 file_path = await asyncio.to_thread(
                     download_media,
                     text,
                     folder
                 )
+
+            # Se il sito non è supportato da yt-dlp,
+            # proviamo come link diretto.
             except Exception:
                 file_path = await asyncio.to_thread(
                     download_direct,
@@ -145,31 +176,44 @@ async def handle_link(
                 )
 
             if not os.path.exists(file_path):
-                raise FileNotFoundError("File non trovato.")
+                raise FileNotFoundError("Video non trovato.")
 
             file_size = os.path.getsize(file_path)
 
             if file_size > MAX_FILE_SIZE:
-                raise ValueError("Il file è troppo grande.")
+                raise ValueError(
+                    "Il video supera il limite di circa 49 MB."
+                )
+
+            # Telegram Bot API richiede normalmente un video
+            # MPEG-4 per l'invio come video.
+            extension = Path(file_path).suffix.lower()
+
+            if extension != ".mp4":
+                raise ValueError(
+                    "Il video non è disponibile in formato MP4."
+                )
 
             await status.edit_text(
-                "📤 Download completato. Te lo invio..."
+                "📤 Video pronto. Te lo invio..."
             )
 
-            with open(file_path, "rb") as document:
-                await update.message.reply_document(
-                    document=document,
-                    caption="✅ Ecco il tuo file."
+            with open(file_path, "rb") as video:
+                await update.message.reply_video(
+                    video=video,
+                    caption="✅ Ecco il tuo video.",
+                    supports_streaming=True,
                 )
 
             await status.delete()
 
-        except Exception:
+        except Exception as error:
+            print(f"Errore download/invio: {error}")
+
             await status.edit_text(
-                "❌ Non sono riuscito a scaricare questo link.\n\n"
-                "Il sito potrebbe non essere supportato, "
-                "il contenuto potrebbe essere protetto "
-                "oppure il file potrebbe essere troppo grande."
+                "❌ Non sono riuscito a scaricare o inviare questo video.\n\n"
+                "Possibili cause: sito non supportato, "
+                "video troppo grande oppure formato non compatibile."
             )
 
 
@@ -216,7 +260,9 @@ class TelegramWebhookHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"OK")
 
-        except Exception:
+        except Exception as error:
+            print(f"Webhook error: {error}")
+
             self.send_response(500)
             self.end_headers()
 
@@ -231,6 +277,7 @@ class TelegramHTTPServer(HTTPServer):
             server_address,
             TelegramWebhookHandler
         )
+
         self.application = application
         self.loop = loop
 
