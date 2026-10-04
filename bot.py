@@ -6,9 +6,11 @@ from pathlib import Path
 from urllib.parse import urlparse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
+import subprocess
 
 import requests
 import yt_dlp
+import imageio_ffmpeg
 
 from telegram import Update
 from telegram.ext import (
@@ -27,6 +29,8 @@ RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 PORT = int(os.environ.get("PORT", "10000"))
 
 MAX_FILE_SIZE = 49 * 1024 * 1024
+
+FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 
 
 def is_allowed(user_id: int) -> bool:
@@ -99,18 +103,68 @@ def download_media(url: str, folder: str) -> str:
         "max_filesize": MAX_FILE_SIZE,
         "quiet": True,
         "no_warnings": True,
-
-        "format": (
-            "best[ext=mp4]/"
-            "best"
-        ),
+        "format": "bestvideo+bestaudio/best",
     }
 
     with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
 
-    return filename
+    if os.path.exists(filename):
+        return filename
+
+    base = os.path.splitext(filename)[0]
+
+    for extension in [".mp4", ".webm", ".mkv", ".mov", ".m4v"]:
+        possible = base + extension
+        if os.path.exists(possible):
+            return possible
+
+    raise FileNotFoundError("Video scaricato ma file non trovato.")
+
+
+def convert_to_telegram_mp4(input_path: str, output_path: str):
+    command = [
+        FFMPEG_PATH,
+        "-y",
+        "-i",
+        input_path,
+
+        # Video compatibile con iPhone/Telegram
+        "-c:v",
+        "libx264",
+
+        # Riduciamo leggermente la qualità se necessario,
+        # mantenendo una buona qualità visiva.
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+
+        # Audio compatibile
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+
+        # Formato compatibile e riproduzione rapida
+        "-movflags",
+        "+faststart",
+
+        output_path,
+    ]
+
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        print("FFmpeg error:")
+        print(result.stderr)
+        raise RuntimeError("Conversione video fallita.")
 
 
 async def handle_link(
@@ -147,7 +201,11 @@ async def handle_link(
                     folder
                 )
 
-            except Exception:
+            except Exception as download_error:
+                print(
+                    f"yt-dlp non riuscito: {download_error}"
+                )
+
                 file_path = await asyncio.to_thread(
                     download_direct,
                     text,
@@ -155,27 +213,45 @@ async def handle_link(
                 )
 
             if not os.path.exists(file_path):
-                raise FileNotFoundError("Video non trovato.")
+                raise FileNotFoundError(
+                    "Video non trovato."
+                )
 
-            file_size = os.path.getsize(file_path)
+            await status.edit_text(
+                "🔧 Sto preparando il video per Telegram..."
+            )
+
+            converted_path = os.path.join(
+                folder,
+                "telegram_video.mp4"
+            )
+
+            await asyncio.to_thread(
+                convert_to_telegram_mp4,
+                file_path,
+                converted_path
+            )
+
+            if not os.path.exists(converted_path):
+                raise FileNotFoundError(
+                    "Conversione video non riuscita."
+                )
+
+            file_size = os.path.getsize(
+                converted_path
+            )
 
             if file_size > MAX_FILE_SIZE:
                 raise ValueError(
-                    "Il video supera il limite di circa 49 MB."
-                )
-
-            extension = Path(file_path).suffix.lower()
-
-            if extension != ".mp4":
-                raise ValueError(
-                    "Il video non è disponibile in formato MP4."
+                    "Dopo la conversione il video supera "
+                    "il limite di circa 49 MB."
                 )
 
             await status.edit_text(
                 "📤 Video pronto. Te lo invio..."
             )
 
-            with open(file_path, "rb") as video:
+            with open(converted_path, "rb") as video:
                 await update.message.reply_video(
                     video=video,
                     caption="✅ Ecco il tuo video.",
@@ -185,12 +261,14 @@ async def handle_link(
             await status.delete()
 
         except Exception as error:
-            print(f"Errore download/invio: {error}")
+            print(
+                f"Errore download/conversione/invio: {error}"
+            )
 
             await status.edit_text(
-                "❌ Non sono riuscito a scaricare o inviare questo video.\n\n"
+                "❌ Non sono riuscito a preparare questo video.\n\n"
                 "Possibili cause: sito non supportato, "
-                "video troppo grande oppure formato non compatibile."
+                "video troppo grande oppure errore di conversione."
             )
 
 
@@ -199,7 +277,10 @@ class TelegramWebhookHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/" or self.path == "/health":
             self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
+            self.send_header(
+                "Content-Type",
+                "text/plain"
+            )
             self.end_headers()
             self.wfile.write(b"OK")
             return
@@ -215,11 +296,17 @@ class TelegramWebhookHandler(BaseHTTPRequestHandler):
 
         try:
             content_length = int(
-                self.headers.get("Content-Length", "0")
+                self.headers.get(
+                    "Content-Length",
+                    "0"
+                )
             )
 
             body = self.rfile.read(content_length)
-            data = json.loads(body.decode("utf-8"))
+
+            data = json.loads(
+                body.decode("utf-8")
+            )
 
             update = Update.de_json(
                 data,
@@ -227,7 +314,9 @@ class TelegramWebhookHandler(BaseHTTPRequestHandler):
             )
 
             future = asyncio.run_coroutine_threadsafe(
-                self.server.application.process_update(update),
+                self.server.application.process_update(
+                    update
+                ),
                 self.server.loop
             )
 
@@ -238,7 +327,9 @@ class TelegramWebhookHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"OK")
 
         except Exception as error:
-            print(f"Webhook error: {error}")
+            print(
+                f"Webhook error: {error}"
+            )
 
             self.send_response(500)
             self.end_headers()
@@ -249,7 +340,12 @@ class TelegramWebhookHandler(BaseHTTPRequestHandler):
 
 class TelegramHTTPServer(HTTPServer):
 
-    def __init__(self, server_address, application, loop):
+    def __init__(
+        self,
+        server_address,
+        application,
+        loop
+    ):
         super().__init__(
             server_address,
             TelegramWebhookHandler
@@ -260,6 +356,7 @@ class TelegramHTTPServer(HTTPServer):
 
 
 async def main():
+
     if not BOT_TOKEN:
         raise RuntimeError(
             "BOT_TOKEN non configurato."
@@ -277,11 +374,17 @@ async def main():
     )
 
     application.add_handler(
-        CommandHandler("start", start)
+        CommandHandler(
+            "start",
+            start
+        )
     )
 
     application.add_handler(
-        CommandHandler("myid", myid)
+        CommandHandler(
+            "myid",
+            myid
+        )
     )
 
     application.add_handler(
