@@ -9,7 +9,6 @@ import json
 
 import requests
 import yt_dlp
-import imageio_ffmpeg
 
 from telegram import Update
 from telegram.ext import (
@@ -28,8 +27,6 @@ RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 PORT = int(os.environ.get("PORT", "10000"))
 
 MAX_FILE_SIZE = 49 * 1024 * 1024
-
-FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 
 
 def is_allowed(user_id: int) -> bool:
@@ -103,30 +100,15 @@ def download_media(url: str, folder: str) -> str:
         "quiet": True,
         "no_warnings": True,
 
-        # Preferiamo MP4 perché Telegram può riprodurlo
-        # direttamente come video.
         "format": (
-            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
             "best[ext=mp4]/"
             "best"
         ),
-
-        # Se servono video+audio separati, li uniamo in MP4.
-        "merge_output_format": "mp4",
-
-        "ffmpeg_location": FFMPEG_PATH,
     }
 
     with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
-
-        # Se yt-dlp ha creato il file MP4 risultante dopo il merge,
-        # usiamo quello.
-        possible_mp4 = os.path.splitext(filename)[0] + ".mp4"
-
-        if os.path.exists(possible_mp4):
-            filename = possible_mp4
 
     return filename
 
@@ -158,7 +140,6 @@ async def handle_link(
 
     with tempfile.TemporaryDirectory() as folder:
         try:
-            # Prima proviamo con yt-dlp.
             try:
                 file_path = await asyncio.to_thread(
                     download_media,
@@ -166,8 +147,6 @@ async def handle_link(
                     folder
                 )
 
-            # Se il sito non è supportato da yt-dlp,
-            # proviamo come link diretto.
             except Exception:
                 file_path = await asyncio.to_thread(
                     download_direct,
@@ -185,8 +164,6 @@ async def handle_link(
                     "Il video supera il limite di circa 49 MB."
                 )
 
-            # Telegram Bot API richiede normalmente un video
-            # MPEG-4 per l'invio come video.
             extension = Path(file_path).suffix.lower()
 
             if extension != ".mp4":
