@@ -7,13 +7,22 @@ from urllib.parse import urlparse
 import requests
 import yt_dlp
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ALLOWED_USER_ID = os.environ.get("ALLOWED_USER_ID", "")
 
-MAX_FILE_SIZE = 49 * 1024 * 1024  # circa 49 MB
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
+PORT = int(os.environ.get("PORT", "10000"))
+
+MAX_FILE_SIZE = 49 * 1024 * 1024
 
 
 def is_allowed(user_id: int) -> bool:
@@ -22,7 +31,8 @@ def is_allowed(user_id: int) -> bool:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Mandami un link e proverò a scaricare il contenuto e rimandartelo qui."
+        "👋 Mandami un link e proverò a scaricare il contenuto "
+        "e rimandartelo qui."
     )
 
 
@@ -42,8 +52,9 @@ def download_direct(url: str, folder: str) -> str:
     response.raise_for_status()
 
     content_length = response.headers.get("content-length")
+
     if content_length and int(content_length) > MAX_FILE_SIZE:
-        raise ValueError("Il file è troppo grande per essere inviato da questo bot.")
+        raise ValueError("Il file è troppo grande.")
 
     filename = Path(urlparse(url).path).name or "download"
     filename = filename[:100]
@@ -51,6 +62,7 @@ def download_direct(url: str, folder: str) -> str:
     path = os.path.join(folder, filename)
 
     total = 0
+
     with open(path, "wb") as file:
         for chunk in response.iter_content(chunk_size=1024 * 256):
             if not chunk:
@@ -61,9 +73,7 @@ def download_direct(url: str, folder: str) -> str:
             if total > MAX_FILE_SIZE:
                 file.close()
                 os.remove(path)
-                raise ValueError(
-                    "Il file è troppo grande per essere inviato da questo bot."
-                )
+                raise ValueError("Il file è troppo grande.")
 
             file.write(chunk)
 
@@ -71,7 +81,10 @@ def download_direct(url: str, folder: str) -> str:
 
 
 def download_media(url: str, folder: str) -> str:
-    output = os.path.join(folder, "%(title).80s.%(ext)s")
+    output = os.path.join(
+        folder,
+        "%(title).80s.%(ext)s"
+    )
 
     options = {
         "outtmpl": output,
@@ -88,15 +101,16 @@ def download_media(url: str, folder: str) -> str:
     return filename
 
 
-async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_link(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
     user_id = update.effective_user.id
 
-    # Prima bisogna configurare il nostro Telegram ID su Render.
     if not is_allowed(user_id):
         await update.message.reply_text(
-            f"🔐 Il bot non è ancora configurato per il tuo account.\n\n"
-            f"Il tuo Telegram ID è:\n{user_id}\n\n"
-            f"Conservalo: ci servirà per configurare il bot."
+            "🔐 Questo bot è privato e non è ancora configurato "
+            "per il tuo account."
         )
         return
 
@@ -108,19 +122,23 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    status = await update.message.reply_text("⏳ Sto scaricando...")
+    status = await update.message.reply_text(
+        "⏳ Sto scaricando..."
+    )
 
     with tempfile.TemporaryDirectory() as folder:
         try:
-            # Prima proviamo con yt-dlp per siti supportati.
             try:
                 file_path = await asyncio.to_thread(
-                    download_media, text, folder
+                    download_media,
+                    text,
+                    folder
                 )
             except Exception:
-                # Se non è un sito supportato, proviamo come file/link diretto.
                 file_path = await asyncio.to_thread(
-                    download_direct, text, folder
+                    download_direct,
+                    text,
+                    folder
                 )
 
             if not os.path.exists(file_path):
@@ -129,9 +147,11 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_size = os.path.getsize(file_path)
 
             if file_size > MAX_FILE_SIZE:
-                raise ValueError("Il file supera il limite consentito.")
+                raise ValueError("Il file è troppo grande.")
 
-            await status.edit_text("📤 Download completato. Te lo invio...")
+            await status.edit_text(
+                "📤 Download completato. Te lo invio..."
+            )
 
             with open(file_path, "rb") as document:
                 await update.message.reply_document(
@@ -141,38 +161,60 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await status.delete()
 
-        except Exception as error:
+        except Exception:
             await status.edit_text(
                 "❌ Non sono riuscito a scaricare questo link.\n\n"
-                "Potrebbe essere un link non supportato, protetto "
-                "oppure un file troppo grande."
+                "Il sito potrebbe non essere supportato, "
+                "il contenuto potrebbe essere protetto "
+                "oppure il file potrebbe essere troppo grande."
             )
 
 
 async def main():
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN non configurato.")
+        raise RuntimeError(
+            "BOT_TOKEN non configurato."
+        )
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    if not RENDER_EXTERNAL_URL:
+        raise RuntimeError(
+            "RENDER_EXTERNAL_URL non configurato."
+        )
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("myid", myid))
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link)
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
     )
 
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()
+    application.add_handler(
+        CommandHandler("start", start)
+    )
 
-    try:
-        while True:
-            await asyncio.sleep(3600)
-    finally:
-        await application.updater.stop()
-        await application.stop()
-        await application.shutdown()
+    application.add_handler(
+        CommandHandler("myid", myid)
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_link
+        )
+    )
+
+    webhook_url = (
+        RENDER_EXTERNAL_URL.rstrip("/")
+        + "/telegram"
+    )
+
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path="telegram",
+        webhook_url=webhook_url,
+        drop_pending_updates=True,
+    )
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
